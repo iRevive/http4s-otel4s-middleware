@@ -21,6 +21,7 @@ package server
 
 import cats.effect.kernel.MonadCancelThrow
 import cats.effect.kernel.Outcome
+import cats.effect.kernel.Resource
 import cats.effect.syntax.monadCancel._
 import cats.mtl.LiftKind
 import cats.syntax.applicative._
@@ -150,40 +151,64 @@ object ServerMiddleware {
           val reqAttributes = spanDataProvider.requestAttributes(reqNoBody, shared)
           G.uncancelable { poll =>
             val tracerG = tracerF.liftTo[G]
-            tracerG.joinOrRoot(req.headers) {
-              tracerG
-                .spanBuilder(spanName)
-                .withSpanKind(SpanKind.Server)
-                .addAttributes(reqAttributes)
-                .build
-                .use { span =>
-                  poll {
-                    http.run(req).flatMap { resp =>
-                      if (perRequestReversePropagationFilter(reqPrelude).isEnabled) {
-                        for (traceHeaders <- tracerG.propagate(Headers.empty))
-                          yield resp.withHeaders(resp.headers ++ traceHeaders)
-                      } else G.pure(resp)
-                    }
-                  }.guaranteeCase {
-                    case Outcome.Succeeded(fa) =>
-                      fa.flatMap { resp =>
-                        val respAttributes =
-                          spanDataProvider.responseAttributes(resp.withBodyStream(Stream.empty))
-                        val isError = errorClassifier.isError(reqPrelude, resp.responsePrelude)
-                        val errorAttributes =
-                          if (isError)
-                            spanDataProvider.errorAttributes(reqPrelude, resp.responsePrelude)
-                          else Attributes.empty
-                        span.addAttributes(respAttributes ++ errorAttributes) >> span
-                          .setStatus(StatusCode.Error)
-                          .whenA(isError)
-                      }
-                    case Outcome.Errored(e) =>
-                      span.addAttributes(spanDataProvider.exceptionAttributes(e))
-                    case Outcome.Canceled() =>
-                      G.unit
+            kt(
+              tracerF.joinOrRoot(req.headers) {
+                tracerF
+                  .spanBuilder(spanName)
+                  .withSpanKind(SpanKind.Server)
+                  .addAttributes(reqAttributes)
+                  .build
+                  .resource
+                  .allocatedCase
+              }
+            ).flatMap { case (res, release) =>
+              val span = res.span
+              val traceG = res.liftTo[G].trace
+
+              traceG {
+                poll {
+                  http.run(req).flatMap { resp =>
+                    if (perRequestReversePropagationFilter(reqPrelude).isEnabled) {
+                      for (traceHeaders <- tracerG.propagate(Headers.empty))
+                        yield resp.withHeaders(resp.headers ++ traceHeaders)
+                    } else G.pure(resp)
                   }
+                }.map { resp =>
+                  val respAttributes =
+                    spanDataProvider.responseAttributes(resp.withBodyStream(Stream.empty))
+                  val isError = errorClassifier.isError(reqPrelude, resp.responsePrelude)
+                  val errorAttributes =
+                    if (isError)
+                      spanDataProvider.errorAttributes(reqPrelude, resp.responsePrelude)
+                    else Attributes.empty
+
+                  resp.pipeBodyThrough(
+                    _.translate(res.trace).onFinalizeCaseWeak { exitCase =>
+                      val exceptionAttributes = exitCase match {
+                        case Resource.ExitCase.Errored(e) =>
+                          span.addAttributes(spanDataProvider.exceptionAttributes(e))
+                        case _ =>
+                          monadCancelThrow.unit
+                      }
+
+                      (span.addAttributes(respAttributes ++ errorAttributes) >>
+                        span.setStatus(StatusCode.Error).whenA(isError) >>
+                        exceptionAttributes).guarantee(release(exitCase))
+                    }
+                  )
+                }.guaranteeCase {
+                  case Outcome.Succeeded(_) =>
+                    G.unit
+                  case Outcome.Errored(e) =>
+                    kt(
+                      span
+                        .addAttributes(spanDataProvider.exceptionAttributes(e))
+                        .guarantee(release(Resource.ExitCase.Errored(e)))
+                    )
+                  case Outcome.Canceled() =>
+                    kt(release(Resource.ExitCase.Canceled))
                 }
+              }
             }
           }
         }

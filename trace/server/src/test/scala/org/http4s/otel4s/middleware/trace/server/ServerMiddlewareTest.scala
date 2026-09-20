@@ -137,7 +137,7 @@ class ServerMiddlewareTest extends CatsEffectSuite {
               val request =
                 Request[IO](Method.GET, uri"http://localhost/?#")
                   .withHeaders(headers)
-              app.run(request)
+              app.run(request).flatMap(_.body.compile.drain)
             }
             spans <- testkit.finishedSpans
           } yield assertSingleSpan(
@@ -210,7 +210,7 @@ class ServerMiddlewareTest extends CatsEffectSuite {
                 )
 
                 for {
-                  _ <- app.run(request).attempt
+                  _ <- app.run(request).flatMap(_.body.compile.drain).attempt
                   spans <- testkit.finishedSpans
                 } yield assertSingleSpan(spans, spanExpectation(attributes, status, events))
               }
@@ -248,7 +248,7 @@ class ServerMiddlewareTest extends CatsEffectSuite {
                 )
 
                 for {
-                  _ <- app.run(request).attempt
+                  _ <- app.run(request).flatMap(_.body.compile.drain).attempt
                   spans <- testkit.finishedSpans
                 } yield assertSingleSpan(spans, spanExpectation(attributes, status))
               }
@@ -288,7 +288,7 @@ class ServerMiddlewareTest extends CatsEffectSuite {
                 )
 
                 for {
-                  _ <- app.run(request).attempt
+                  _ <- app.run(request).flatMap(_.body.compile.drain).attempt
                   spans <- testkit.finishedSpans
                 } yield assertSingleSpan(
                   spans,
@@ -392,7 +392,7 @@ class ServerMiddlewareTest extends CatsEffectSuite {
               HttpApp[IO](_.body.compile.drain.as(Response[IO](Status.Ok)))
             }
               .run(Request[IO](Method.GET, uri"http://localhost/"))
-              .map(_.headers)
+              .flatMap(response => response.body.compile.drain.as(response.headers))
             _ <- testkit.finishedSpans
           } yield assert(headers.get(ci"traceparent").isEmpty)
         }
@@ -424,7 +424,7 @@ class ServerMiddlewareTest extends CatsEffectSuite {
               HttpApp[IO](_.body.compile.drain.as(Response[IO](Status.Ok)))
             }
               .run(Request[IO](Method.GET, uri"http://localhost/"))
-              .map(_.headers)
+              .flatMap(response => response.body.compile.drain.as(response.headers))
             spans <- testkit.finishedSpans
           } yield assertSingleSpan(
             spans,
@@ -451,6 +451,278 @@ class ServerMiddlewareTest extends CatsEffectSuite {
   }
   suite("asHttpRoutesMiddleware") { (sm, app) =>
     sm.asHttpRoutesMiddleware(app.mapK(OptionT.liftK)).orNotFound
+  }
+
+  test("keeps the server span current and open until the response body terminates") {
+    TracesTestkit
+      .inMemory[IO]()
+      .use { testkit =>
+        implicit val TP: TracerProvider[IO] = testkit.tracerProvider
+
+        for {
+          tracer <- testkit.tracerProvider.get("test")
+          serverMiddleware <- ServerMiddleware
+            .builder[IO](ServerSpanDataProvider.openTelemetry(NoopRedactor))
+            .build
+          bodyStarted <- IO.deferred[Unit]
+          allowBodyCompletion <- IO.deferred[Unit]
+          bodyFinalizerSpanContext <- IO.deferred[Option[org.typelevel.otel4s.trace.SpanContext]]
+          body = fs2.Stream
+            .eval(
+              bodyStarted.complete(()).void >>
+                allowBodyCompletion.get
+            )
+            .drain
+            .onFinalize(
+              tracer.currentSpanContext.flatMap(bodyFinalizerSpanContext.complete).void
+            )
+          app = serverMiddleware.wrapHttpApp(
+            HttpApp.pure[IO](Response[IO](Status.Ok).withBodyStream(body))
+          )
+          response <- app.run(Request[IO](Method.GET, uri"http://localhost/"))
+          bodyFiber <- response.body.compile.drain.start
+          _ <- bodyStarted.get
+          spansWhileBodyIsRunning <- testkit.finishedSpans
+          _ <- allowBodyCompletion.complete(())
+          _ <- bodyFiber.joinWithNever
+          currentContextInBodyFinalizer <- bodyFinalizerSpanContext.get
+          spansAfterBodyCompletion <- testkit.finishedSpans
+        } yield {
+          assertEquals(
+            spansWhileBodyIsRunning,
+            Nil,
+            "the server span must not finish before the response body",
+          )
+          assertEquals(spansAfterBodyCompletion.length, 1)
+          assertEquals(
+            currentContextInBodyFinalizer,
+            spansAfterBodyCompletion.headOption.map(_.spanContext),
+            "response-body finalizers must run with the server span as current",
+          )
+        }
+      }
+  }
+
+  test("records an exception thrown while streaming the response body") {
+    TestControl.executeEmbed {
+      TracesTestkit
+        .inMemory[IO]()
+        .use { testkit =>
+          implicit val TP: TracerProvider[IO] = testkit.tracerProvider
+          val error = new RuntimeException("response body failed") with NoStackTrace {}
+
+          ServerMiddleware
+            .builder[IO](ServerSpanDataProvider.openTelemetry(NoopRedactor))
+            .build
+            .flatMap { serverMiddleware =>
+              val app = serverMiddleware.wrapHttpApp(
+                HttpApp.pure[IO](
+                  Response[IO](Status.Ok).withBodyStream(fs2.Stream.raiseError[IO](error))
+                )
+              )
+              val request = Request[IO](Method.GET, uri"http://localhost/")
+              val attributes = Attributes(
+                ErrorAttributes.ErrorType(error.getClass.getName),
+                HttpAttributes.HttpRequestMethod(HttpAttributes.HttpRequestMethodValue.Get),
+                HttpAttributes.HttpResponseStatusCode(200L),
+                NetworkAttributes.NetworkProtocolVersion("1.1"),
+                UrlAttributes.UrlPath("/"),
+                UrlAttributes.UrlScheme("http"),
+              )
+              val events = Vector(
+                EventData.fromException(
+                  Duration.Zero,
+                  error,
+                  LimitedData.attributes(
+                    spanLimits.maxNumberOfAttributes,
+                    spanLimits.maxAttributeValueLength,
+                  ),
+                )
+              )
+
+              for {
+                response <- app.run(request)
+                _ <- response.body.compile.drain.attempt
+                spans <- testkit.finishedSpans
+              } yield assertSingleSpan(
+                spans,
+                spanExpectation(attributes, StatusData(StatusCode.Error), events),
+              )
+            }
+        }
+    }
+  }
+
+  test("records an exception thrown by a response body finalizer") {
+    TestControl.executeEmbed {
+      TracesTestkit
+        .inMemory[IO]()
+        .use { testkit =>
+          implicit val TP: TracerProvider[IO] = testkit.tracerProvider
+          val error = new RuntimeException("response body finalizer failed") with NoStackTrace {}
+
+          ServerMiddleware
+            .builder[IO](ServerSpanDataProvider.openTelemetry(NoopRedactor))
+            .build
+            .flatMap { serverMiddleware =>
+              val body = fs2.Stream
+                .emit(1.toByte)
+                .covary[IO]
+                .onFinalize(IO.raiseError[Unit](error))
+              val app = serverMiddleware.wrapHttpApp(
+                HttpApp.pure[IO](Response[IO](Status.Ok).withBodyStream(body))
+              )
+              val request = Request[IO](Method.GET, uri"http://localhost/")
+              val attributes = Attributes(
+                ErrorAttributes.ErrorType(error.getClass.getName),
+                HttpAttributes.HttpRequestMethod(HttpAttributes.HttpRequestMethodValue.Get),
+                HttpAttributes.HttpResponseStatusCode(200L),
+                NetworkAttributes.NetworkProtocolVersion("1.1"),
+                UrlAttributes.UrlPath("/"),
+                UrlAttributes.UrlScheme("http"),
+              )
+              val events = Vector(
+                EventData.fromException(
+                  Duration.Zero,
+                  error,
+                  LimitedData.attributes(
+                    spanLimits.maxNumberOfAttributes,
+                    spanLimits.maxAttributeValueLength,
+                  ),
+                )
+              )
+
+              for {
+                response <- app.run(request)
+                result <- response.body.compile.drain.attempt
+                spans <- testkit.finishedSpans
+              } yield {
+                assertEquals(result, Left(error))
+                assertSingleSpan(
+                  spans,
+                  spanExpectation(attributes, StatusData(StatusCode.Error), events),
+                )
+              }
+            }
+        }
+    }
+  }
+
+  test("keeps the server span current in inner weak body finalizers") {
+    TracesTestkit
+      .inMemory[IO]()
+      .use { testkit =>
+        implicit val TP: TracerProvider[IO] = testkit.tracerProvider
+
+        for {
+          tracer <- testkit.tracerProvider.get("test")
+          currentContext <- IO.ref(Option.empty[org.typelevel.otel4s.trace.SpanContext])
+          serverMiddleware <- ServerMiddleware
+            .builder[IO](ServerSpanDataProvider.openTelemetry(NoopRedactor))
+            .build
+          body = fs2.Stream
+            .emit(1.toByte)
+            .covary[IO]
+            .onFinalizeWeak(tracer.currentSpanContext.flatMap(currentContext.set))
+          app = serverMiddleware.wrapHttpApp(
+            HttpApp.pure[IO](Response[IO](Status.Ok).withBodyStream(body))
+          )
+          response <- app.run(Request[IO](Method.GET, uri"http://localhost/"))
+          _ <- response.body.compile.drain
+          spans <- testkit.finishedSpans
+          context <- currentContext.get
+        } yield {
+          assertEquals(spans.length, 1)
+          assertEquals(context, spans.headOption.map(_.spanContext))
+        }
+      }
+  }
+
+  test("cannot finish the server span when an outer middleware discards the body") {
+    TracesTestkit
+      .inMemory[IO]()
+      .use { testkit =>
+        implicit val TP: TracerProvider[IO] = testkit.tracerProvider
+
+        for {
+          serverMiddleware <- ServerMiddleware
+            .builder[IO](ServerSpanDataProvider.openTelemetry(NoopRedactor))
+            .build
+          app = serverMiddleware.wrapHttpApp(HttpApp.pure[IO](Response[IO](Status.Ok)))
+          response <- app.run(Request[IO](Method.GET, uri"http://localhost/"))
+          _ <- response.withBodyStream(fs2.Stream.empty).body.compile.drain
+          spans <- testkit.finishedSpans
+        } yield assertEquals(spans, Nil)
+      }
+  }
+
+  test("does not extend server context to body effects added outside tracing") {
+    TracesTestkit
+      .inMemory[IO]()
+      .use { testkit =>
+        implicit val TP: TracerProvider[IO] = testkit.tracerProvider
+
+        for {
+          tracer <- testkit.tracerProvider.get("test")
+          currentContext <- IO.ref(Option.empty[org.typelevel.otel4s.trace.SpanContext])
+          serverMiddleware <- ServerMiddleware
+            .builder[IO](ServerSpanDataProvider.openTelemetry(NoopRedactor))
+            .build
+          app = serverMiddleware.wrapHttpApp(HttpApp.pure[IO](Response[IO](Status.Ok)))
+          response <- app.run(Request[IO](Method.GET, uri"http://localhost/"))
+          _ <- (response.body ++ fs2.Stream.exec(
+            tracer.currentSpanContext.flatMap(currentContext.set)
+          )).compile.drain
+          spans <- testkit.finishedSpans
+          context <- currentContext.get
+        } yield {
+          assertEquals(spans.length, 1)
+          assertEquals(context, None)
+        }
+      }
+  }
+
+  test("records cancellation while streaming the response body") {
+    TestControl.executeEmbed {
+      TracesTestkit
+        .inMemory[IO]()
+        .use { testkit =>
+          implicit val TP: TracerProvider[IO] = testkit.tracerProvider
+
+          ServerMiddleware
+            .builder[IO](ServerSpanDataProvider.openTelemetry(NoopRedactor))
+            .build
+            .flatMap { serverMiddleware =>
+              val request = Request[IO](Method.GET, uri"http://localhost/")
+              val attributes = Attributes(
+                HttpAttributes.HttpRequestMethod(HttpAttributes.HttpRequestMethodValue.Get),
+                HttpAttributes.HttpResponseStatusCode(200L),
+                NetworkAttributes.NetworkProtocolVersion("1.1"),
+                UrlAttributes.UrlPath("/"),
+                UrlAttributes.UrlScheme("http"),
+              )
+
+              for {
+                bodyStarted <- IO.deferred[Unit]
+                app = serverMiddleware.wrapHttpApp(
+                  HttpApp.pure[IO](
+                    Response[IO](Status.Ok).withBodyStream(
+                      fs2.Stream.eval(bodyStarted.complete(()).void >> IO.never[Byte])
+                    )
+                  )
+                )
+                response <- app.run(request)
+                bodyFiber <- response.body.compile.drain.start
+                _ <- bodyStarted.get
+                _ <- bodyFiber.cancel
+                spans <- testkit.finishedSpans
+              } yield assertSingleSpan(
+                spans,
+                spanExpectation(attributes, StatusData(StatusCode.Error, "canceled")),
+              )
+            }
+        }
+    }
   }
 
   test("treats 500 as an error by default") {
@@ -485,7 +757,7 @@ class ServerMiddlewareTest extends CatsEffectSuite {
               )
 
               for {
-                _ <- app.run(request).attempt
+                _ <- app.run(request).flatMap(_.body.compile.drain).attempt
                 spans <- testkit.finishedSpans
               } yield assertSingleSpan(spans, spanExpectation(attributes, status))
             }
@@ -524,7 +796,7 @@ class ServerMiddlewareTest extends CatsEffectSuite {
               )
 
               for {
-                _ <- app.run(request).attempt
+                _ <- app.run(request).flatMap(_.body.compile.drain).attempt
                 spans <- testkit.finishedSpans
               } yield assertSingleSpan(
                 spans,
@@ -568,7 +840,7 @@ class ServerMiddlewareTest extends CatsEffectSuite {
               )
 
               for {
-                _ <- app.run(request).attempt
+                _ <- app.run(request).flatMap(_.body.compile.drain).attempt
                 spans <- testkit.finishedSpans
               } yield assertSingleSpan(spans, spanExpectation(attributes, status))
             }
@@ -609,7 +881,7 @@ class ServerMiddlewareTest extends CatsEffectSuite {
               )
 
               for {
-                _ <- app.run(request).attempt
+                _ <- app.run(request).flatMap(_.body.compile.drain).attempt
                 spans <- testkit.finishedSpans
               } yield assertSingleSpan(spans, spanExpectation(attributes, status))
             }
@@ -648,7 +920,7 @@ class ServerMiddlewareTest extends CatsEffectSuite {
               )
 
               for {
-                _ <- app.run(request).attempt
+                _ <- app.run(request).flatMap(_.body.compile.drain).attempt
                 spans <- testkit.finishedSpans
               } yield assertSingleSpan(
                 spans,
@@ -694,8 +966,8 @@ class ServerMiddlewareTest extends CatsEffectSuite {
               val request = Request[IO](Method.GET, uri"http://localhost/")
 
               for {
-                _ <- errorApp.run(request).attempt
-                _ <- okApp.run(request).attempt
+                _ <- errorApp.run(request).flatMap(_.body.compile.drain).attempt
+                _ <- okApp.run(request).flatMap(_.body.compile.drain).attempt
                 spans <- testkit.finishedSpans
               } yield assertTrace(
                 spans,
