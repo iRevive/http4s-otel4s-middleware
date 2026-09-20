@@ -861,6 +861,181 @@ class ServerMiddlewareTest extends CatsEffectSuite {
     }
   }
 
+  test("records an exception thrown by a weak response body finalizer") {
+    TestControl.executeEmbed {
+      TracesTestkit
+        .inMemory[IO]()
+        .use { testkit =>
+          implicit val TP: TracerProvider[IO] = testkit.tracerProvider
+          val error = new RuntimeException("weak response body finalizer failed")
+            with NoStackTrace {}
+
+          ServerMiddleware
+            .builder[IO](ServerSpanDataProvider.openTelemetry(NoopRedactor))
+            .build
+            .flatMap { serverMiddleware =>
+              val body = fs2.Stream
+                .emit(1.toByte)
+                .covary[IO]
+                .onFinalizeWeak(IO.raiseError[Unit](error))
+              val app = serverMiddleware.wrapHttpApp(
+                HttpApp.pure[IO](Response[IO](Status.Ok).withBodyStream(body))
+              )
+              val request = Request[IO](Method.GET, uri"http://localhost/")
+              val attributes = Attributes(
+                ErrorAttributes.ErrorType(error.getClass.getName),
+                HttpAttributes.HttpRequestMethod(HttpAttributes.HttpRequestMethodValue.Get),
+                HttpAttributes.HttpResponseStatusCode(200L),
+                NetworkAttributes.NetworkProtocolVersion("1.1"),
+                UrlAttributes.UrlPath("/"),
+                UrlAttributes.UrlScheme("http"),
+              )
+              val events = Vector(
+                EventData.fromException(
+                  Duration.Zero,
+                  error,
+                  LimitedData.attributes(
+                    spanLimits.maxNumberOfAttributes,
+                    spanLimits.maxAttributeValueLength,
+                  ),
+                )
+              )
+
+              for {
+                response <- app.run(request)
+                result <- response.body.compile.drain.attempt
+                spans <- testkit.finishedSpans
+              } yield {
+                assertEquals(result, Left(error))
+                assertSingleSpan(
+                  spans,
+                  spanExpectation(attributes, StatusData(StatusCode.Error), events),
+                )
+              }
+            }
+        }
+    }
+  }
+
+  test("finishes the server span after combined body evaluation and cleanup failures") {
+    TracesTestkit
+      .inMemory[IO]()
+      .use { testkit =>
+        implicit val TP: TracerProvider[IO] = testkit.tracerProvider
+        val evaluationError = new RuntimeException("response body failed") with NoStackTrace {}
+        val cleanupError = new RuntimeException("response body cleanup failed") with NoStackTrace {}
+
+        for {
+          serverMiddleware <- ServerMiddleware
+            .builder[IO](ServerSpanDataProvider.openTelemetry(NoopRedactor))
+            .build
+          body = fs2.Stream
+            .raiseError[IO](evaluationError)
+            .onFinalizeWeak(IO.raiseError[Unit](cleanupError))
+          app = serverMiddleware.wrapHttpApp(
+            HttpApp.pure[IO](Response[IO](Status.Ok).withBodyStream(body))
+          )
+          response <- app.run(Request[IO](Method.GET, uri"http://localhost/"))
+          result <- response.body.compile.drain.attempt
+          spans <- testkit.finishedSpans
+        } yield {
+          assert(result.isLeft)
+          assertEquals(spans.length, 1)
+          assertEquals(spans.head.status.status, StatusCode.Error)
+          assertEquals(spans.head.events.elements.length, 1)
+        }
+      }
+  }
+
+  test("records failing body cleanup during cancellation") {
+    TracesTestkit
+      .inMemory[IO]()
+      .use { testkit =>
+        implicit val TP: TracerProvider[IO] = testkit.tracerProvider
+        val cleanupError = new RuntimeException("response body cleanup failed") with NoStackTrace {}
+
+        for {
+          bodyStarted <- IO.deferred[Unit]
+          cleanupAttempts <- IO.ref(0)
+          serverMiddleware <- ServerMiddleware
+            .builder[IO](ServerSpanDataProvider.openTelemetry(NoopRedactor))
+            .build
+          body = fs2.Stream
+            .eval(bodyStarted.complete(()).void >> IO.never[Byte])
+            .onFinalizeWeak(
+              cleanupAttempts.update(_ + 1) >> IO.raiseError[Unit](cleanupError)
+            )
+          app = serverMiddleware.wrapHttpApp(
+            HttpApp.pure[IO](Response[IO](Status.Ok).withBodyStream(body))
+          )
+          response <- app.run(Request[IO](Method.GET, uri"http://localhost/"))
+          fiber <- response.body.compile.drain.start
+          _ <- bodyStarted.get
+          _ <- fiber.cancel
+          cleanups <- cleanupAttempts.get
+          spans <- testkit.finishedSpans
+        } yield {
+          assertEquals(cleanups, 1)
+          assertEquals(spans.length, 1)
+          assertEquals(spans.head.status.status, StatusCode.Error)
+          assertEquals(spans.head.events.elements.length, 0)
+        }
+      }
+  }
+
+  test("finishes the server span when response consumption terminates through take") {
+    TracesTestkit
+      .inMemory[IO]()
+      .use { testkit =>
+        implicit val TP: TracerProvider[IO] = testkit.tracerProvider
+
+        for {
+          bodyFinalized <- IO.ref(false)
+          serverMiddleware <- ServerMiddleware
+            .builder[IO](ServerSpanDataProvider.openTelemetry(NoopRedactor))
+            .build
+          body = fs2.Stream
+            .emits(List(1.toByte, 2.toByte))
+            .covary[IO]
+            .onFinalize(bodyFinalized.set(true))
+          app = serverMiddleware.wrapHttpApp(
+            HttpApp.pure[IO](Response[IO](Status.Ok).withBodyStream(body))
+          )
+          response <- app.run(Request[IO](Method.GET, uri"http://localhost/"))
+          _ <- response.body.take(1).compile.drain
+          finalized <- bodyFinalized.get
+          spans <- testkit.finishedSpans
+        } yield {
+          assert(finalized)
+          assertEquals(spans.length, 1)
+        }
+      }
+  }
+
+  test("keeps the server span open for the lifetime of compile.resource") {
+    TracesTestkit
+      .inMemory[IO]()
+      .use { testkit =>
+        implicit val TP: TracerProvider[IO] = testkit.tracerProvider
+
+        for {
+          serverMiddleware <- ServerMiddleware
+            .builder[IO](ServerSpanDataProvider.openTelemetry(NoopRedactor))
+            .build
+          app = serverMiddleware.wrapHttpApp(
+            HttpApp.pure[IO](
+              Response[IO](Status.Ok).withBodyStream(fs2.Stream.emit(1.toByte).covary[IO])
+            )
+          )
+          response <- app.run(Request[IO](Method.GET, uri"http://localhost/"))
+          _ <- response.body.compile.resource.drain.use { _ =>
+            testkit.finishedSpans.map(spans => assertEquals(spans, Nil))
+          }
+          spans <- testkit.finishedSpans
+        } yield assertEquals(spans.length, 1)
+      }
+  }
+
   test("keeps the server span current in inner weak body finalizers") {
     TracesTestkit
       .inMemory[IO]()

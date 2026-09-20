@@ -230,7 +230,7 @@ object ServerMiddleware {
                         else Attributes.empty
 
                       resp.pipeBodyThrough(
-                        _.translate(res.trace).onFinalizeCaseWeak { exitCase =>
+                        _.scope.translate(res.trace).onFinalizeCaseWeak { exitCase =>
                           val completeSpan =
                             span.addAttributes(respAttributes ++ errorAttributes) >>
                               span.setStatus(StatusCode.Error).whenA(isError) >>
