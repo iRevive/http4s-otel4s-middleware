@@ -18,11 +18,14 @@ package org.http4s
 package otel4s.middleware.trace
 package server
 
+import cats.data.EitherT
 import cats.data.OptionT
+import cats.effect.Concurrent
 import cats.effect.IO
 import cats.effect.MonadCancelThrow
 import cats.effect.testkit.TestControl
 import cats.mtl.LiftKind
+import cats.syntax.semigroupk._
 import munit.CatsEffectSuite
 import org.http4s.otel4s.middleware.trace.redact.HeaderRedactor
 import org.http4s.otel4s.middleware.trace.redact.PathRedactor
@@ -71,7 +74,7 @@ class ServerMiddlewareTest extends CatsEffectSuite {
     test(s"$methodName: composes middlewares") {
       def middleware(name: String)(implicit tracer: Tracer[IO]): ServerMiddleware[IO] =
         new ServerMiddleware[IO] {
-          implicit def monadCancelThrow: MonadCancelThrow[IO] = IO.asyncForIO
+          implicit def concurrent: Concurrent[IO] = IO.asyncForIO
           def wrapGenericHttp[G[_]: MonadCancelThrow](http: Http[G, IO])(implicit
               kt: LiftKind[IO, G]
           ): Http[G, IO] = Http[G, IO] { request =>
@@ -451,6 +454,184 @@ class ServerMiddlewareTest extends CatsEffectSuite {
   }
   suite("asHttpRoutesMiddleware") { (sm, app) =>
     sm.asHttpRoutesMiddleware(app.mapK(OptionT.liftK)).orNotFound
+  }
+
+  test("releases the server span when an HttpRoutes does not match") {
+    TracesTestkit
+      .inMemory[IO]()
+      .use { testkit =>
+        implicit val TP: TracerProvider[IO] = testkit.tracerProvider
+
+        for {
+          serverMiddleware <- ServerMiddleware
+            .builder[IO](ServerSpanDataProvider.openTelemetry(NoopRedactor))
+            .build
+          app = serverMiddleware.wrapHttpRoutes(HttpRoutes.empty[IO]).orNotFound
+          _ <- app.run(Request[IO](Method.GET, uri"http://localhost/missing"))
+          spans <- testkit.finishedSpans
+        } yield assertEquals(spans.length, 1)
+      }
+  }
+
+  test("releases spans for unmatched branches in composed HttpRoutes") {
+    TracesTestkit
+      .inMemory[IO]()
+      .use { testkit =>
+        implicit val TP: TracerProvider[IO] = testkit.tracerProvider
+
+        for {
+          serverMiddleware <- ServerMiddleware
+            .builder[IO](ServerSpanDataProvider.openTelemetry(NoopRedactor))
+            .build
+          unmatched = serverMiddleware.wrapHttpRoutes(HttpRoutes.empty[IO])
+          matched = serverMiddleware.wrapHttpRoutes(
+            HttpRoutes.of[IO] { case _ => IO.pure(Response[IO](Status.Ok)) }
+          )
+          response <- (unmatched <+> matched).orNotFound.run(
+            Request[IO](Method.GET, uri"http://localhost/")
+          )
+          _ <- response.body.compile.drain
+          spans <- testkit.finishedSpans
+        } yield assertEquals(spans.length, 2)
+      }
+  }
+
+  test("releases the server span when an arbitrary handler effect short-circuits") {
+    type Handler[A] = EitherT[IO, String, A]
+
+    TracesTestkit
+      .inMemory[IO]()
+      .use { testkit =>
+        implicit val TP: TracerProvider[IO] = testkit.tracerProvider
+
+        for {
+          serverMiddleware <- ServerMiddleware
+            .builder[IO](ServerSpanDataProvider.openTelemetry(NoopRedactor))
+            .build
+          http = Http[Handler, IO](_ => EitherT.leftT[IO, Response[IO]]("short-circuit"))
+          result <- serverMiddleware
+            .wrapGenericHttp(http)
+            .run(Request[IO](Method.GET, uri"http://localhost/"))
+            .value
+          spans <- testkit.finishedSpans
+        } yield {
+          assertEquals(result, Left("short-circuit"))
+          assertEquals(spans.length, 1)
+        }
+      }
+  }
+
+  test("finishes the server span once when the response body is replayed") {
+    TracesTestkit
+      .inMemory[IO]()
+      .use { testkit =>
+        implicit val TP: TracerProvider[IO] = testkit.tracerProvider
+
+        for {
+          serverMiddleware <- ServerMiddleware
+            .builder[IO](ServerSpanDataProvider.openTelemetry(NoopRedactor))
+            .build
+          app = serverMiddleware.wrapHttpApp(
+            HttpApp.pure[IO](
+              Response[IO](Status.Ok).withBodyStream(fs2.Stream.emit(1.toByte).covary[IO])
+            )
+          )
+          response <- app.run(Request[IO](Method.GET, uri"http://localhost/"))
+          _ <- response.body.compile.drain
+          spansAfterFirstEvaluation <- testkit.finishedSpans
+          _ <- response.body.compile.drain
+          spansAfterReplay <- testkit.finishedSpans
+        } yield {
+          assertEquals(spansAfterFirstEvaluation.length, 1)
+          assertEquals(spansAfterReplay, Nil)
+        }
+      }
+  }
+
+  List(false, true).foreach { failInBody =>
+    val location = if (failInBody) "response body" else "request handler"
+
+    test(s"releases the server span when exception attributes throw for a $location error") {
+      TracesTestkit
+        .inMemory[IO]()
+        .use { testkit =>
+          implicit val TP: TracerProvider[IO] = testkit.tracerProvider
+          val originalError = new RuntimeException(s"$location failed") with NoStackTrace {}
+          val brokenProvider = new AttributeProvider {
+            def requestAttributes[F[_]](request: Request[F]): Attributes = Attributes.empty
+            def responseAttributes[F[_]](response: Response[F]): Attributes = Attributes.empty
+            def exceptionAttributes(cause: Throwable): Attributes =
+              throw new IllegalStateException("exception attribute provider failed")
+          }
+          val app =
+            if (failInBody)
+              HttpApp.pure[IO](
+                Response[IO](Status.Ok)
+                  .withBodyStream(fs2.Stream.raiseError[IO](originalError))
+              )
+            else HttpApp[IO](_ => IO.raiseError(originalError))
+
+          for {
+            serverMiddleware <- ServerMiddleware
+              .builder[IO](
+                ServerSpanDataProvider.openTelemetry(NoopRedactor).and(brokenProvider)
+              )
+              .build
+            result <- serverMiddleware
+              .wrapHttpApp(app)
+              .run(Request[IO](Method.GET, uri"http://localhost/"))
+              .flatMap(_.body.compile.drain)
+              .attempt
+            spans <- testkit.finishedSpans
+          } yield {
+            assertEquals(result, Left(originalError))
+            assertEquals(spans.length, 1)
+          }
+        }
+    }
+  }
+
+  List(false, true).foreach { failInErrorAttributes =>
+    val callback = if (failInErrorAttributes) "errorAttributes" else "responseAttributes"
+
+    test(s"releases the server span when $callback throws") {
+      TracesTestkit
+        .inMemory[IO]()
+        .use { testkit =>
+          implicit val TP: TracerProvider[IO] = testkit.tracerProvider
+          val providerError = new RuntimeException(s"$callback failed") with NoStackTrace {}
+          val brokenProvider = new AttributeProvider {
+            def requestAttributes[F[_]](request: Request[F]): Attributes = Attributes.empty
+            def responseAttributes[F[_]](response: Response[F]): Attributes =
+              if (failInErrorAttributes) Attributes.empty else throw providerError
+            def exceptionAttributes(cause: Throwable): Attributes = Attributes.empty
+            override def errorAttributes(
+                request: RequestPrelude,
+                response: ResponsePrelude,
+            ): Attributes =
+              if (failInErrorAttributes) throw providerError else Attributes.empty
+          }
+          val status =
+            if (failInErrorAttributes) Status.InternalServerError else Status.Ok
+
+          for {
+            serverMiddleware <- ServerMiddleware
+              .builder[IO](
+                ServerSpanDataProvider.openTelemetry(NoopRedactor).and(brokenProvider)
+              )
+              .build
+            result <- serverMiddleware
+              .wrapHttpApp(HttpApp.pure[IO](Response[IO](status)))
+              .run(Request[IO](Method.GET, uri"http://localhost/"))
+              .flatMap(_.body.compile.drain)
+              .attempt
+            spans <- testkit.finishedSpans
+          } yield {
+            assertEquals(result, Left(providerError))
+            assertEquals(spans.length, 1)
+          }
+        }
+    }
   }
 
   test("keeps the server span current and open until the response body terminates") {
