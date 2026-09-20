@@ -23,6 +23,7 @@ import cats.data.OptionT
 import cats.effect.Concurrent
 import cats.effect.IO
 import cats.effect.MonadCancelThrow
+import cats.effect.Resource
 import cats.effect.testkit.TestControl
 import cats.mtl.LiftKind
 import cats.syntax.semigroupk._
@@ -632,6 +633,77 @@ class ServerMiddlewareTest extends CatsEffectSuite {
           }
         }
     }
+  }
+
+  test("finishOnce preserves an original failure when telemetry and cleanup also fail") {
+    val originalError = new RuntimeException("application failed") with NoStackTrace {}
+    val telemetryError = new RuntimeException("telemetry update failed") with NoStackTrace {}
+    val cleanupError = new RuntimeException("span cleanup failed") with NoStackTrace {}
+
+    for {
+      ownership <- IO.ref[ServerMiddleware.Ownership](ServerMiddleware.HandlerOwned)
+      completionCount <- IO.ref(0)
+      releaseCount <- IO.ref(0)
+      result <- ServerMiddleware
+        .finishOnce(
+          ownership,
+          ServerMiddleware.HandlerOwned,
+          Resource.ExitCase.Errored(originalError),
+        )(
+          completionCount.update(_ + 1) >> IO.raiseError(telemetryError),
+          _ => releaseCount.update(_ + 1) >> IO.raiseError(cleanupError),
+        )
+        .attempt
+      finalOwnership <- ownership.get
+      completions <- completionCount.get
+      releases <- releaseCount.get
+    } yield {
+      assertEquals(result, Right(()))
+      assertEquals(finalOwnership, ServerMiddleware.Finished)
+      assertEquals(completions, 1)
+      assertEquals(releases, 1)
+    }
+  }
+
+  test("finishOnce propagates telemetry failure after a successful exchange and still cleans up") {
+    val telemetryError = new RuntimeException("telemetry update failed") with NoStackTrace {}
+
+    for {
+      ownership <- IO.ref[ServerMiddleware.Ownership](ServerMiddleware.BodyOwned)
+      releaseCount <- IO.ref(0)
+      result <- ServerMiddleware
+        .finishOnce(
+          ownership,
+          ServerMiddleware.BodyOwned,
+          Resource.ExitCase.Succeeded,
+        )(
+          IO.raiseError(telemetryError),
+          _ => releaseCount.update(_ + 1),
+        )
+        .attempt
+      releases <- releaseCount.get
+    } yield {
+      assertEquals(result, Left(telemetryError))
+      assertEquals(releases, 1)
+    }
+  }
+
+  test("finishOnce propagates cleanup failure after a successful exchange") {
+    val cleanupError = new RuntimeException("span cleanup failed") with NoStackTrace {}
+
+    for {
+      ownership <- IO.ref[ServerMiddleware.Ownership](ServerMiddleware.BodyOwned)
+      result <- ServerMiddleware
+        .finishOnce(
+          ownership,
+          ServerMiddleware.BodyOwned,
+          Resource.ExitCase.Succeeded,
+        )(
+          IO.unit,
+          _ => IO.raiseError(cleanupError),
+        )
+        .attempt
+    } yield assertEquals(result, Left(cleanupError))
   }
 
   test("keeps the server span current and open until the response body terminates") {

@@ -130,10 +130,34 @@ trait ServerMiddleware[F[_]] { self =>
 }
 
 object ServerMiddleware {
-  private sealed trait Ownership
-  private case object HandlerOwned extends Ownership
-  private case object BodyOwned extends Ownership
-  private case object Finished extends Ownership
+  private[server] sealed trait Ownership
+  private[server] case object HandlerOwned extends Ownership
+  private[server] case object BodyOwned extends Ownership
+  private[server] case object Finished extends Ownership
+
+  private[server] def finishOnce[F[_]](
+      ownership: Ref[F, Ownership],
+      owner: Ownership,
+      exitCase: Resource.ExitCase,
+  )(completeSpan: F[Unit], release: Resource.ExitCase => F[Unit])(implicit
+      F: MonadCancelThrow[F]
+  ): F[Unit] =
+    F.uncancelable { _ =>
+      ownership
+        .modify {
+          case `owner` => (Finished, true)
+          case state => (state, false)
+        }
+        .flatMap { shouldFinish =>
+          if (shouldFinish) {
+            val finalizeSpan = completeSpan.guarantee(release(exitCase))
+            exitCase match {
+              case Resource.ExitCase.Succeeded => finalizeSpan
+              case _ => finalizeSpan.attempt.void
+            }
+          } else F.unit
+        }
+    }
 
   private[this] final class Impl[F[_]](
       tracerF: Tracer[F],
@@ -182,22 +206,6 @@ object ServerMiddleware {
                   case NonFatal(cause) => concurrent.raiseError(cause)
                 }
 
-              def finishOnce(
-                  owner: Ownership,
-                  exitCase: Resource.ExitCase,
-              )(completeSpan: F[Unit]): F[Unit] =
-                concurrent.uncancelable { _ =>
-                  ownership
-                    .modify {
-                      case `owner` => (Finished, true)
-                      case state => (state, false)
-                    }
-                    .flatMap { shouldFinish =>
-                      if (shouldFinish) completeSpan.guarantee(release(exitCase))
-                      else concurrent.unit
-                    }
-                }
-
               def recordException(cause: Throwable): F[Unit] =
                 catchNonFatal(spanDataProvider.exceptionAttributes(cause))
                   .flatMap(attributes => span.addAttributes(attributes))
@@ -232,12 +240,10 @@ object ServerMiddleware {
                                 case _ =>
                                   concurrent.unit
                               })
-                          val protectedCompletion = exitCase match {
-                            case Resource.ExitCase.Succeeded => completeSpan
-                            case _ => completeSpan.attempt.void
-                          }
-
-                          finishOnce(BodyOwned, exitCase)(protectedCompletion)
+                          ServerMiddleware.finishOnce(ownership, BodyOwned, exitCase)(
+                            completeSpan,
+                            release,
+                          )
                         }
                       )
                     }
@@ -245,17 +251,27 @@ object ServerMiddleware {
                 }.guaranteeCase {
                   case Outcome.Succeeded(_) =>
                     kt(
-                      finishOnce(HandlerOwned, Resource.ExitCase.Succeeded)(concurrent.unit)
+                      ServerMiddleware.finishOnce(
+                        ownership,
+                        HandlerOwned,
+                        Resource.ExitCase.Succeeded,
+                      )(concurrent.unit, release)
                     )
                   case Outcome.Errored(cause) =>
                     kt(
-                      finishOnce(HandlerOwned, Resource.ExitCase.Errored(cause))(
-                        recordException(cause).attempt.void
-                      )
+                      ServerMiddleware.finishOnce(
+                        ownership,
+                        HandlerOwned,
+                        Resource.ExitCase.Errored(cause),
+                      )(recordException(cause), release)
                     )
                   case Outcome.Canceled() =>
                     kt(
-                      finishOnce(HandlerOwned, Resource.ExitCase.Canceled)(concurrent.unit)
+                      ServerMiddleware.finishOnce(
+                        ownership,
+                        HandlerOwned,
+                        Resource.ExitCase.Canceled,
+                      )(concurrent.unit, release)
                     )
                 }
               }
