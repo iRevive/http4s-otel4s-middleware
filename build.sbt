@@ -18,6 +18,7 @@ ThisBuild / tlJdkRelease := Some(8)
 
 val catsEffectV = "3.7.1"
 val http4sV = "0.23.37"
+val http4sSnapshotV = "0.23.37-10-6d612d2-20260914T175713Z-SNAPSHOT"
 val munitV = "1.3.6"
 val munitCatsEffectV = "2.2.0"
 val openTelemetryV = "1.66.0"
@@ -29,7 +30,7 @@ val baseName = "http4s-otel4s-middleware"
 
 val sharedSettings = Seq(
   libraryDependencies ++= Seq(
-    "org.http4s" %%% "http4s-core" % "0.23.37-10-6d612d2-20260914T175713Z-SNAPSHOT",
+    "org.http4s" %%% "http4s-core" % http4sSnapshotV,
     "org.typelevel" %%% "otel4s-core-common" % otel4sV,
     "org.typelevel" %%% "otel4s-semconv" % otel4sV,
     "org.typelevel" %%% "otel4s-semconv-experimental" % otel4sV % Test,
@@ -99,9 +100,8 @@ lazy val metrics = crossProject(JVMPlatform, JSPlatform, NativePlatform)
     libraryDependencies ++= Seq(
       "org.typelevel" %%% "otel4s-core-metrics" % otel4sV,
       "org.typelevel" %%% "otel4s-semconv-metrics-experimental" % otel4sV % Test,
-      "org.http4s" %%% "http4s-server" % "0.23.37-10-6d612d2-20260914T175713Z-SNAPSHOT" % Test,
-      "org.http4s" %%% "http4s-client" % "0.23.37-10-6d612d2-20260914T175713Z-SNAPSHOT" % Test,
-      "org.http4s" %%% "http4s-client" % http4sV % Test,
+      "org.http4s" %%% "http4s-server" % http4sSnapshotV % Test,
+      "org.http4s" %%% "http4s-client" % http4sSnapshotV % Test,
     ),
   )
 
@@ -169,6 +169,8 @@ lazy val examples = project
     libraryDependencies ++= Seq(
       "org.typelevel" %%% "cats-effect" % catsEffectV,
       "org.http4s" %%% "http4s-core" % http4sV,
+      "org.http4s" %% "http4s-server" % http4sSnapshotV,
+      "org.http4s" %% "http4s-client" % http4sSnapshotV,
       "org.http4s" %% "http4s-dsl" % http4sV,
       "org.http4s" %% "http4s-ember-server" % http4sV,
       "org.http4s" %% "http4s-ember-client" % http4sV,
